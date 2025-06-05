@@ -1,0 +1,23 @@
+## Carpetas propias de Visual Studio
+.vs/
+bin/
+obj/
+
+## Archivos de índices y cachés de VS
+*.vsidx
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+## Archivos generados por compilación o paquetes NuGet
+*.dll
+*.exe
+*.cache
+*.log
+
+## Archivos temporales del sistema
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+~$*
