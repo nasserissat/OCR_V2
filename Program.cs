@@ -14,11 +14,25 @@ using System.Reflection;
 using PdfiumViewer;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Linq;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
 
 namespace PDFTextExtractor
 {
     class Program
     {
+        // --- Constantes y configuraciones para coincidencia difusa ---
+        private static readonly string[] FRASES_BANCO = new[]
+        {
+            "A FAVOR DEL BANCO DE RESERVAS",
+            "BANCO DE RESERVAS",
+            "A FAVOR DEL BANCO RESERVAS"
+        };
+
+        private const double SIMILITUD_THRESHOLD = 75.0; // Porcentaje mínimo de similitud aceptado
+
+        // --------------------------------------------------------------
         static void Main(string[] args)
         {
             Console.OutputEncoding = Encoding.UTF8;
@@ -175,14 +189,18 @@ namespace PDFTextExtractor
                                 SavePageAsImageWithPdfium(pdfPath, i, imagePath);
                                 if (File.Exists(imagePath))
                                 {
-                                    using (var bitmap = new Bitmap(imagePath))
+                                    using (var loadedBitmap = new Bitmap(imagePath))
                                     {
-                                        string ocrText = ApplyOcrToImage(bitmap);
-
-                                        // Elegimos el texto más largo entre extracción directa y OCR
-                                        if (ocrText.Length > finalText.Length)
+                                        // Preprocesar la imagen antes de aplicar OCR
+                                        using (var enhancedBitmap = PreprocessImageBeforeEnhancer(loadedBitmap))
                                         {
-                                            finalText = ocrText;
+                                            string ocrText = ApplyOcrToImage(enhancedBitmap);
+
+                                            // Elegimos el texto más largo entre extracción directa y OCR
+                                            if (ocrText.Length > finalText.Length)
+                                            {
+                                                finalText = ocrText;
+                                            }
                                         }
                                     }
                                 }
@@ -350,16 +368,26 @@ namespace PDFTextExtractor
             var inscripcionRegex = new Regex(@"(?:Inscrito el:|Inscrito)\s*(?:([\d/]+)\s*[-–]?\s*([\d:]+\s*(?:AM|PM|am|pm))|([\d/]+))", RegexOptions.IgnoreCase);
             var referenciaRegex = new Regex(@"(?:Referencia\s*/\s*Origen|Libro\s+de\s+T[ií]tulos\s*:?|Libro\s+No\.?)\s*[:.]?\s*(.*?)$", RegexOptions.IgnoreCase | RegexOptions.Multiline);
             var identificacionRegex = new Regex(@"(?:No\.?|N[úu]mero|Identificaci[óo]n)\s*(\d{9})", RegexOptions.IgnoreCase);
+            
+            // Verificar coincidencias exactas (mantener para compatibilidad)
             var bancoRegex = new Regex(@"(?:a favor de|BANCO)\s+(?:BANCO\s+(?:DE\s+)?)?RESERVAS", RegexOptions.IgnoreCase);
+            bool coincidenciaExacta = bancoRegex.IsMatch(texto);
+            
+            // Verificar coincidencias por similitud
+            double maxSimilitud = 0.0;
+            bool coincidenciaPorSimilitud = FuzzyPhraseMatch(texto, FRASES_BANCO, SIMILITUD_THRESHOLD, out maxSimilitud);
             
             // Buscar explícitamente menciones a BANCO RESERVAS
-            bool encontroBancoReservas = bancoRegex.IsMatch(texto);
+            bool encontroBancoReservas = coincidenciaExacta || coincidenciaPorSimilitud;
+            
             if (encontroBancoReservas)
             {
-                Console.WriteLine("\n*** ENCONTRADA REFERENCIA A BANCO RESERVAS! ***\n");
+                Console.WriteLine(coincidenciaPorSimilitud ? 
+                    $"\n*** ENCONTRADA REFERENCIA A BANCO RESERVAS POR SIMILITUD ({maxSimilitud:F2}%)! ***\n" :
+                    "\n*** ENCONTRADA REFERENCIA EXACTA A BANCO RESERVAS! ***\n");
             }
             
-            // Dividir en párrafos para mejor procesamiento - usamos un umbral más bajo para no perder partes del asiento
+            // Dividir en párrafos para mejor procesamiento
             var paragraphs = Regex.Split(texto, @"(?:\r?\n){1,}");
             AsientoRegistral currentAsiento = null;
             
@@ -434,8 +462,9 @@ namespace PDFTextExtractor
                 {
                     InscripcionesYAsientos = "Inscrito el: [Fecha extraída parcialmente]",
                     ReferenciaOrigen = "Libro de Títulos [Extraído parcialmente]",
-                    Identificacion = "[ID Parcial]",
-                    DescripcionDelAsiento = "HIPOTECA CONVENCIONAL EN PRIMER RANGO, a favor de BANCO DE RESERVAS DE LA REPÚBLICA DOMINICANA. El derecho tiene su origen en documento de fecha [Extraído parcialmente]."
+                    Identificacion = coincidenciaPorSimilitud ? $"Similitud: {maxSimilitud:F2}%" : "[ID Parcial]",
+                    DescripcionDelAsiento = "HIPOTECA CONVENCIONAL EN PRIMER RANGO, a favor de BANCO DE RESERVAS DE LA REPÚBLICA DOMINICANA. El derecho tiene su origen en documento de fecha [Extraído parcialmente].",
+                    EsCoincidenciaPorSimilitud = coincidenciaPorSimilitud && !coincidenciaExacta
                 };
                 
                 asientos.Add(nuevoAsiento);
@@ -709,11 +738,11 @@ namespace PDFTextExtractor
         }
 
         // Método para guardar una página de PDF como imagen usando PdfiumViewer
-        private static void SavePageAsImageWithPdfium(string pdfPath, int pageNum, string outputPath, int dpi = 600)
+        private static void SavePageAsImageWithPdfium(string pdfPath, int pageNum, string outputPath, int dpi = 900)
         {
             try
             {
-                Console.WriteLine($"Guardando página {pageNum} como imagen usando PdfiumViewer...");
+                Console.WriteLine($"Guardando página {pageNum} como imagen usando PdfiumViewer a {dpi} DPI...");
                 
                 // Asegurarse de que PdfiumViewer esté inicializado
                 InitPdfiumEnvironment();
@@ -726,25 +755,29 @@ namespace PDFTextExtractor
                         throw new ArgumentException($"Número de página inválido. El documento tiene {document.PageCount} páginas.");
                     }
                     
-                    // Usamos el valor de dpi recibido como parámetro
-                    // No necesitamos redefinirlo aquí
+                    // Aumentamos la resolución para mejorar calidad de imagen
+                    // Ahora el valor por defecto es 900 DPI para más detalle
                     
                     // Renderizar la página como imagen
                     using (var image = document.Render(pageNum - 1, dpi, dpi, true))
                     {
-                        // Mejorar la imagen para OCR utilizando el optimizador especializado para documentos registrales
-                        using (var enhancedImage = ImageEnhancer.EnhanceForOcr((Bitmap)image))
+                        // Aplicar mejoras preliminares a la imagen antes de pasarla al ImageEnhancer
+                        using (var preprocessedImage = PreprocessImageBeforeEnhancer((Bitmap)image))
                         {
-                            // Guardar la imagen mejorada
-                            enhancedImage.Save(outputPath, System.Drawing.Imaging.ImageFormat.Png);
-                            Console.WriteLine($"Imagen mejorada guardada en: {outputPath}");
-                            
-                            // Guardar una copia de la imagen original para comparación (debug)
-                            string originalPath = Path.Combine(
-                                Path.GetDirectoryName(outputPath),
-                                Path.GetFileNameWithoutExtension(outputPath) + "_original.png"
-                            );
-                            image.Save(originalPath, System.Drawing.Imaging.ImageFormat.Png);
+                            // Mejorar la imagen para OCR utilizando el optimizador especializado para documentos registrales
+                            using (var enhancedImage = ImageEnhancer.EnhanceForOcr(preprocessedImage))
+                            {
+                                // Guardar la imagen mejorada
+                                enhancedImage.Save(outputPath, System.Drawing.Imaging.ImageFormat.Png);
+                                Console.WriteLine($"Imagen mejorada guardada en: {outputPath}");
+                                
+                                // Guardar una copia de la imagen original para comparación (debug)
+                                string originalPath = Path.Combine(
+                                    Path.GetDirectoryName(outputPath),
+                                    Path.GetFileNameWithoutExtension(outputPath) + "_original.png"
+                                );
+                                image.Save(originalPath, System.Drawing.Imaging.ImageFormat.Png);
+                            }
                         }
                     }
                 }
@@ -918,15 +951,113 @@ namespace PDFTextExtractor
             }
         }
 
+        // Método para preprocesar imagen antes de pasarla a ImageEnhancer
+        private static Bitmap PreprocessImageBeforeEnhancer(Bitmap original)
+        {
+            try
+            {
+                Console.WriteLine("Realizando preprocesamiento inicial de imagen...");
+                
+                // Crear una copia de la imagen que podamos modificar
+                Bitmap preprocessed = new Bitmap(original.Width, original.Height);
+                
+                // Configurar para alta calidad
+                using (Graphics g = Graphics.FromImage(preprocessed))
+                {
+                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+                    g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                    g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
+                    
+                    // Dibujar la imagen original
+                    g.DrawImage(original, 0, 0, preprocessed.Width, preprocessed.Height);
+                }
+                
+                // Aplicar filtros de realce
+                // 1. Ajustar el contraste para textos más definidos
+                AdjustContrast(preprocessed, 40); // Contraste más fuerte para destacar texto
+                
+                return preprocessed;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error en preprocesamiento: {ex.Message}");
+                return original; // En caso de error, devolver la imagen original
+            }
+        }
+
+        // Método para aplicar OCR con múltiples modos de segmentación para mejorar resultados
+        private static string ApplyOcrWithMultipleSegmentationModes(Bitmap image, string tessDataPath)
+        {
+            // Probar diferentes modos de segmentación y quedarnos con el mejor resultado
+            string bestText = string.Empty;
+            float bestConfidence = 0;
+            
+            // Modos de segmentación de página a probar
+            int[] segModes = new int[] { 6, 11, 3, 1 }; // PSM_SINGLE_BLOCK, PSM_SPARSE_TEXT, PSM_AUTO, PSM_AUTO_OSD
+            
+            foreach (int mode in segModes)
+            {
+                string modeText = string.Empty;
+                float modeConfidence = 0;
+                
+                try
+                {
+                    // Crear motor de OCR
+                    using (var engine = new TesseractEngine(tessDataPath, "spa+eng", EngineMode.TesseractAndLstm))
+                    {
+                        // Configuraciones optimizadas
+                        engine.SetVariable("tessedit_char_whitelist", "ABCDEFGHIJKLMNÑOPQRSTUVWXYZabcdefghijklmnñopqrstuvwxyzáéíóúÁÉÍÓÚüÜ0123456789.,;:!?()[]{}¿?¡!\"'$%&/\\-_@<>*+=#");
+                        engine.SetVariable("page_separator", "");
+                        engine.SetVariable("tessedit_do_invert", "0");
+                        engine.SetVariable("tessedit_pageseg_mode", mode.ToString());
+                        engine.SetVariable("textord_heavy_nr", "1");
+                        engine.SetVariable("textord_force_make_prop_words", "F");
+                        engine.SetVariable("language_model_penalty_non_dict_word", "0.5");
+                        engine.SetVariable("language_model_penalty_non_freq_dict_word", "0.5");
+                        engine.SetVariable("preserve_interword_spaces", "1");
+                        engine.SetVariable("user_defined_dpi", "900");
+                        
+                        // Procesar imagen
+                        using (var img = PixConverter.ToPix(image))
+                        {
+                            using (var page = engine.Process(img))
+                            {
+                                modeText = page.GetText()?.Trim();
+                                modeConfidence = page.GetMeanConfidence();
+                                
+                                Console.WriteLine($"Modo {mode}: {modeText.Length} caracteres, confianza {modeConfidence * 100:F1}%");
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error en modo {mode}: {ex.Message}");
+                    continue;
+                }
+                
+                // Actualizar mejor resultado si este modo es mejor
+                // Criterios: preferimos texto más largo si la confianza es similar, o más confianza si el tamaño es similar
+                if (modeText.Length > bestText.Length * 1.2 || 
+                    (modeText.Length >= bestText.Length * 0.8 && modeConfidence > bestConfidence * 1.1))
+                {
+                    bestText = modeText;
+                    bestConfidence = modeConfidence;
+                }
+            }
+            
+            return bestText;
+        }
+
         // Método para aplicar OCR a una imagen
         private static string ApplyOcrToImage(Bitmap image)
         {
             string text = string.Empty;
-            bool success = false;
             
             try
             {
-                Console.WriteLine($"Aplicando OCR a la imagen...");
+                Console.WriteLine("Aplicando OCR mejorado a la imagen...");
                 
                 // Ruta a los datos de entrenamiento de Tesseract
                 string tessDataPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tessdata");
@@ -937,64 +1068,163 @@ namespace PDFTextExtractor
                     Console.WriteLine("Intentando usar la configuración por defecto...");
                 }
                 
-                // Crear motor de OCR
-                using (var engine = new TesseractEngine(tessDataPath, "spa", EngineMode.TesseractAndLstm))
+                // Optimizar imagen para mejor detección de texto
+                using (var optimizedImg = OptimizeImageForTextOcr(image))
                 {
-                    // Configurar parámetros de OCR optimizados para documentos legales/registrales
-                    engine.SetVariable("tessedit_char_whitelist", "ABCDEFGHIJKLMNÑOPQRSTUVWXYZabcdefghijklmnñopqrstuvwxyzáéíóúÁÉÍÓÚüÜ0123456789.,;:()[]{}¿?¡!\"'$%&/\\-_@<>*+=#");
-                    engine.SetVariable("page_separator", "");
-                    engine.SetVariable("tessedit_do_invert", "0");
+                    // Aplicar OCR con múltiples configuraciones
+                    text = ApplyOcrWithMultipleSegmentationModes(optimizedImg, tessDataPath);
                     
-                    // Usar modo de segmentación para reconocer texto disperso (mejor para documentos con estructura)
-                    engine.SetVariable("tessedit_pageseg_mode", "11"); // 11=Sparse text, mejor para documentos con secciones
-                    
-                    // Configuraciones adicionales para mejorar precisión en documentos notariales
-                    engine.SetVariable("textord_heavy_nr", "1");
-                    engine.SetVariable("textord_force_make_prop_words", "F");
-                    engine.SetVariable("tessedit_adaption_debug", "1");
-                    engine.SetVariable("language_model_penalty_non_dict_word", "0.5"); // Ser menos estrictos con palabras que no están en el diccionario
-                    engine.SetVariable("language_model_penalty_non_freq_dict_word", "0.5");
-                    engine.SetVariable("tessdata_manager_debug_level", "0");
-                    engine.SetVariable("paragraph_text_based", "0"); // Mejor para documentos estructurados
-                    engine.SetVariable("preserve_interword_spaces", "1"); // Preservar espacios
-                    engine.SetVariable("user_defined_dpi", "600"); // Especificar el DPI para mejor reconocimiento
-                    
-                    // Procesar la imagen
-                    using (var img = PixConverter.ToPix(image))
+                    // Si no encontramos suficiente texto, probar rotaciones
+                    if (text.Length < 200)
                     {
-                        using (var page = engine.Process(img))
+                        Console.WriteLine("Texto insuficiente, probando con rotaciones...");
+                        
+                        // Probar con ángulos estratégicos para capturar texto mal orientado
+                        int[] rotations = new int[] { 90, 180, 270, 5, 355 };
+                        
+                        foreach (int angle in rotations)
                         {
-                            // Obtener el texto reconocido
-                            text = page.GetText();
-                            
-                            // Verificar confianza del OCR
-                            float confidence = page.GetMeanConfidence();
-                            Console.WriteLine($"Confianza del OCR: {confidence * 100:F1}%");
-                            
-                            success = confidence > 0.5f;
+                            using (var rotated = RotateImage(optimizedImg, angle))
+                            {
+                                string rotatedText = ApplyOcrWithMultipleSegmentationModes(rotated, tessDataPath);
+                                if (rotatedText.Length > text.Length * 1.2) // 20% más largo
+                                {
+                                    text = rotatedText;
+                                    Console.WriteLine($"Mejor resultado en rotación {angle}°");
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
                 
-                if (!success && string.IsNullOrWhiteSpace(text))
+                if (string.IsNullOrWhiteSpace(text))
                 {
                     Console.WriteLine("No se pudo extraer texto con OCR");
-                    // Asegurar que devolvamos al menos un texto mínimo para que el programa continúe
                     return "[Texto no reconocido]";
                 }
-                else
-                {
-                    Console.WriteLine($"OCR completado. Se extrajeron {text.Length} caracteres.");
-                }
                 
+                Console.WriteLine($"OCR completado. Se extrajeron {text.Length} caracteres.");
                 return text;
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error en OCR de imagen: {ex.Message}");
-                
                 return string.Empty;
             }
+        }
+        
+        // Optimiza imagen específicamente para OCR de texto
+        private static Bitmap OptimizeImageForTextOcr(Bitmap original)
+        {
+            Bitmap optimized = new Bitmap(original.Width, original.Height);
+            
+            // Copiar la imagen original
+            using (Graphics g = Graphics.FromImage(optimized))
+            {
+                g.DrawImage(original, 0, 0);
+            }
+            
+            // Convertir a escala de grises para mejorar contraste de texto
+            ConvertToGrayscale(optimized);
+            
+            // Aumentar contraste para texto más claro
+            AdjustContrast(optimized, 50);
+            
+            return optimized;
+        }
+        
+        // Convierte imagen a escala de grises
+        private static void ConvertToGrayscale(Bitmap bitmap)
+        {
+            Rectangle rect = new Rectangle(0, 0, bitmap.Width, bitmap.Height);
+            BitmapData bmpData = bitmap.LockBits(rect, ImageLockMode.ReadWrite, bitmap.PixelFormat);
+            
+            try
+            {
+                IntPtr ptr = bmpData.Scan0;
+                int bytes = bmpData.Stride * bitmap.Height;
+                byte[] rgbValues = new byte[bytes];
+                
+                // Copiar el bitmap a un array
+                Marshal.Copy(ptr, rgbValues, 0, bytes);
+                
+                // Convertir a escala de grises
+                for (int i = 0; i < rgbValues.Length; i += 4)
+                {
+                    byte blue = rgbValues[i];
+                    byte green = rgbValues[i + 1];
+                    byte red = rgbValues[i + 2];
+                    
+                    // Aplicar fórmula para escala de grises
+                    byte gray = (byte)(0.299 * red + 0.587 * green + 0.114 * blue);
+                    
+                    rgbValues[i] = gray;
+                    rgbValues[i + 1] = gray;
+                    rgbValues[i + 2] = gray;
+                    // Mantener el canal alfa (i + 3) sin cambios
+                }
+                
+                // Copiar de vuelta al bitmap
+                Marshal.Copy(rgbValues, 0, ptr, bytes);
+            }
+            finally
+            {
+                bitmap.UnlockBits(bmpData);
+            }
+        }
+
+        // Calcula la distancia de Levenshtein entre dos cadenas
+        private static int CalculateLevenshteinDistance(string s, string t)
+        {
+            if (string.IsNullOrEmpty(s)) return string.IsNullOrEmpty(t) ? 0 : t.Length;
+            if (string.IsNullOrEmpty(t)) return s.Length;
+
+            int n = s.Length;
+            int m = t.Length;
+            int[,] d = new int[n + 1, m + 1];
+
+            for (int i = 0; i <= n; i++) d[i, 0] = i;
+            for (int j = 0; j <= m; j++) d[0, j] = j;
+
+            for (int i = 1; i <= n; i++)
+            {
+                for (int j = 1; j <= m; j++)
+                {
+                    int cost = (char.ToUpperInvariant(s[i - 1]) == char.ToUpperInvariant(t[j - 1])) ? 0 : 1;
+                    d[i, j] = Math.Min(
+                        Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1),
+                        d[i - 1, j - 1] + cost);
+                }
+            }
+            return d[n, m];
+        }
+
+        // Devuelve true si se encuentra alguna frase objetivo en el texto con similitud >= umbral
+        private static bool FuzzyPhraseMatch(string text, string[] targetPhrases, double similarityThreshold, out double maxSimilarity)
+        {
+            maxSimilarity = 0.0;
+            if (string.IsNullOrWhiteSpace(text)) return false;
+
+            string cleanedText = Regex.Replace(text.ToUpperInvariant(), @"\s+", " ");
+
+            foreach (string phrase in targetPhrases)
+            {
+                string upperPhrase = phrase.ToUpperInvariant();
+                int window = upperPhrase.Length;
+                if (cleanedText.Length < window) continue;
+
+                for (int i = 0; i <= cleanedText.Length - window; i++)
+                {
+                    string segment = cleanedText.Substring(i, window);
+                    int dist = CalculateLevenshteinDistance(segment, upperPhrase);
+                    double similarity = (1.0 - dist / (double)window) * 100.0;
+                    if (similarity > maxSimilarity) maxSimilarity = similarity;
+                    if (similarity >= similarityThreshold)
+                        return true;
+                }
+            }
+            return false;
         }
 
         private static void InitTesseractEnvironment()
